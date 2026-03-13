@@ -49,6 +49,7 @@ import {
 } from "./core/port-discovery.js";
 import { registerTokenBrowserApp } from "./apps/token-browser/server.js";
 import { registerDesignSystemDashboardApp } from "./apps/design-system-dashboard/server.js";
+import { SessionTracker, sanitizeParams } from "./core/session-tracker.js";
 
 const logger = createChildLogger({ component: "local-server" });
 
@@ -63,6 +64,7 @@ class LocalFigmaConsoleMCP {
 	private figmaAPI: FigmaAPI | null = null;
 	private desktopConnector: IFigmaConnector | null = null;
 	private wsServer: FigmaWebSocketServer | null = null;
+	private sessionTracker: SessionTracker | null = null;
 	private wsStartupError: { code: string; port: number } | null = null;
 	/** The port the WebSocket server actually bound to (may differ from preferred if fallback occurred) */
 	private wsActualPort: number | null = null;
@@ -464,6 +466,75 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 			throw new Error(
 				`Initialization failed: ${error instanceof Error ? error.message : String(error)}`,
 			);
+		}
+	}
+
+	/**
+	 * Wrap a tool handler to log the call as a ToolCallEvent in the session tracker.
+	 * Detects errors from result.isError rather than exceptions, since all handlers
+	 * catch internally and return { isError: true } rather than throwing.
+	 */
+	private async withLogging<T extends { isError?: boolean; content?: any[] }>(
+		toolName: string,
+		params: Record<string, unknown>,
+		fn: () => Promise<T>,
+		summarize?: (params: Record<string, unknown>) => string | null,
+	): Promise<T> {
+		if (!this.sessionTracker) return fn();
+
+		const startedAt = Date.now();
+		const page = this.sessionTracker.getCurrentPage();
+		const fileKey = this.sessionTracker.getCurrentFileKey();
+		const fileName = this.sessionTracker.getCurrentFileName();
+		const safeParams = sanitizeParams(params);
+
+		try {
+			const result = await fn();
+			const durationMs = Date.now() - startedAt;
+			const isError = result.isError === true;
+
+			let errorMessage: string | null = null;
+			if (isError && result.content?.[0]?.text) {
+				try {
+					const parsed = JSON.parse(result.content[0].text as string);
+					errorMessage = typeof parsed.error === "string" ? parsed.error : null;
+				} catch {
+					// Non-fatal parse failure
+				}
+			}
+
+			this.sessionTracker.logEvent({
+				kind: "tool_call",
+				timestamp: startedAt,
+				fileKey,
+				fileName,
+				tool: toolName,
+				params: safeParams,
+				success: !isError,
+				durationMs,
+				resultSummary: !isError && summarize ? summarize(safeParams) : null,
+				errorMessage,
+				page,
+			});
+
+			return result;
+		} catch (error) {
+			// Rare path — handlers usually catch internally
+			const durationMs = Date.now() - startedAt;
+			this.sessionTracker.logEvent({
+				kind: "tool_call",
+				timestamp: startedAt,
+				fileKey,
+				fileName,
+				tool: toolName,
+				params: safeParams,
+				success: false,
+				durationMs,
+				resultSummary: null,
+				errorMessage: error instanceof Error ? error.message : String(error),
+				page,
+			});
+			throw error;
 		}
 	}
 
@@ -1662,6 +1733,84 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 			},
 		);
 
+		// Tool: Get Session Log
+		this.server.tool(
+			"figma_get_session_log",
+			"Get the structured activity log for the current Figma Desktop Bridge session. " +
+			"Returns recorded tool calls (Assisted Work), enriched document change events (Manual Work), " +
+			"page navigations, and file connections since the MCP server started. " +
+			"Designed to be consumed by /figlog to generate a plain-language session report.",
+			{
+				since: z
+					.number()
+					.optional()
+					.describe("Only return events after this Unix timestamp (ms). Omit for the full log."),
+				kinds: z
+					.array(z.enum(["file_connected", "page_changed", "selection_changed", "document_changed", "tool_call"]))
+					.optional()
+					.describe("Filter to specific event kinds. Omit for all events."),
+				includeSelectionChanges: z
+					.boolean()
+					.optional()
+					.default(false)
+					.describe("Include selection_changed events (high volume). Default false."),
+			},
+			async ({ since, kinds, includeSelectionChanges }) => {
+				try {
+					if (!this.sessionTracker) {
+						return {
+							content: [{
+								type: "text" as const,
+								text: JSON.stringify({
+									error: "Session tracker not initialised. The Desktop Bridge plugin may not be connected.",
+									log: null,
+								}),
+							}],
+							isError: true,
+						};
+					}
+
+					const log = this.sessionTracker.getLog();
+					let events = log.events;
+
+					if (since !== undefined) {
+						events = events.filter(e => e.timestamp >= since);
+					}
+					if (kinds && kinds.length > 0) {
+						events = events.filter(e => kinds.includes(e.kind as any));
+					}
+					if (!includeSelectionChanges) {
+						events = events.filter(e => e.kind !== "selection_changed");
+					}
+
+					return {
+						content: [{
+							type: "text" as const,
+							text: JSON.stringify({
+								sessionId: log.sessionId,
+								startedAt: log.startedAt,
+								lastUpdatedAt: log.lastUpdatedAt,
+								files: log.files,
+								eventCount: events.length,
+								events,
+							}),
+						}],
+					};
+				} catch (error) {
+					return {
+						content: [{
+							type: "text" as const,
+							text: JSON.stringify({
+								error: error instanceof Error ? error.message : String(error),
+								message: "Failed to get session log",
+							}),
+						}],
+						isError: true,
+					};
+				}
+			},
+		);
+
 		// Tool: List all open files connected via WebSocket
 		this.server.tool(
 			"figma_list_open_files",
@@ -1775,7 +1924,10 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 						"Execution timeout in milliseconds (default: 5000, max: 30000)",
 					),
 			},
-			async ({ code, timeout }) => {
+			async ({ code, timeout }) => this.withLogging(
+				"figma_execute",
+				{code, timeout},
+				async () => {
 				const maxRetries = 2;
 				let lastError: Error | null = null;
 
@@ -1875,7 +2027,9 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 					],
 					isError: true,
 				};
-			},
+				},
+				(p) => `Executed custom code in Figma plugin context`,
+			),
 		);
 
 		// Tool: Update a variable's value
@@ -1899,7 +2053,10 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 						"The new value. For COLOR: hex string like '#FF0000'. For FLOAT: number. For STRING: text. For BOOLEAN: true/false.",
 					),
 			},
-			async ({ variableId, modeId, value }) => {
+			async ({ variableId, modeId, value }) => this.withLogging(
+				"figma_update_variable",
+				{variableId, modeId, value},
+				async () => {
 				try {
 					const connector = await this.getDesktopConnector();
 					const result = await connector.updateVariable(
@@ -1942,7 +2099,9 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 						isError: true,
 					};
 				}
-			},
+				},
+				(p) => `Updated variable ${p.variableId}`,
+			),
 		);
 
 		// Tool: Create a new variable
@@ -2569,7 +2728,10 @@ return {
 					.max(100)
 					.describe("Array of updates to apply (1-100)"),
 			},
-			async ({ updates }) => {
+			async ({ updates }) => this.withLogging(
+				"figma_batch_update_variables",
+				{updates},
+				async () => {
 				try {
 					const connector = await this.getDesktopConnector();
 
@@ -2668,7 +2830,9 @@ return {
 						isError: true,
 					};
 				}
-			},
+				},
+				(p) => `Updated ${Array.isArray(p.updates) ? p.updates.length : '?'} variable value(s)`,
+			),
 		);
 
 		// Tool: Setup design tokens (collection + modes + variables atomically)
@@ -3625,7 +3789,10 @@ After instantiating components, use figma_take_screenshot to verify the result l
 				overrides,
 				position,
 				parentId,
-			}) => {
+			}) => this.withLogging(
+				"figma_instantiate_component",
+				{componentKey, nodeId, variant, overrides, position, parentId},
+				async () => {
 				try {
 					if (!componentKey && !nodeId) {
 						throw new Error("Either componentKey or nodeId is required");
@@ -3680,7 +3847,9 @@ After instantiating components, use figma_take_screenshot to verify the result l
 						isError: true,
 					};
 				}
-			},
+				},
+				(p) => `Instantiated component${p.componentKey ? ': key ' + p.componentKey : ''}`,
+			),
 		);
 
 		// ============================================================================
@@ -3980,7 +4149,10 @@ After instantiating components, use figma_take_screenshot to verify the result l
 						"Whether to apply child constraints during resize (default: true)",
 					),
 			},
-			async ({ nodeId, width, height, withConstraints }) => {
+			async ({ nodeId, width, height, withConstraints }) => this.withLogging(
+				"figma_resize_node",
+				{nodeId, width, height, withConstraints},
+				async () => {
 				try {
 					const connector = await this.getDesktopConnector();
 					const result = await connector.resizeNode(
@@ -4025,7 +4197,9 @@ After instantiating components, use figma_take_screenshot to verify the result l
 						isError: true,
 					};
 				}
-			},
+				},
+				(p) => `Resized node to ${p.width}\u00d7${p.height}`,
+			),
 		);
 
 		// Tool: Move Node
@@ -4037,7 +4211,10 @@ After instantiating components, use figma_take_screenshot to verify the result l
 				x: z.number().describe("New X position"),
 				y: z.number().describe("New Y position"),
 			},
-			async ({ nodeId, x, y }) => {
+			async ({ nodeId, x, y }) => this.withLogging(
+				"figma_move_node",
+				{nodeId, x, y},
+				async () => {
 				try {
 					const connector = await this.getDesktopConnector();
 					const result = await connector.moveNode(nodeId, x, y);
@@ -4077,7 +4254,9 @@ After instantiating components, use figma_take_screenshot to verify the result l
 						isError: true,
 					};
 				}
-			},
+				},
+				(p) => `Moved node to (${p.x}, ${p.y})`,
+			),
 		);
 
 		// Tool: Set Node Fills
@@ -4105,7 +4284,10 @@ After instantiating components, use figma_take_screenshot to verify the result l
 					)
 					.describe("Array of fill objects"),
 			},
-			async ({ nodeId, fills }) => {
+			async ({ nodeId, fills }) => this.withLogging(
+				"figma_set_fills",
+				{nodeId, fills},
+				async () => {
 				try {
 					const connector = await this.getDesktopConnector();
 					const result = await connector.setNodeFills(nodeId, fills);
@@ -4145,7 +4327,9 @@ After instantiating components, use figma_take_screenshot to verify the result l
 						isError: true,
 					};
 				}
-			},
+				},
+				(p) => `Updated fills on node ${p.nodeId}`,
+			),
 		);
 
 		// Tool: Set Node Strokes
@@ -4168,7 +4352,10 @@ After instantiating components, use figma_take_screenshot to verify the result l
 					.optional()
 					.describe("Stroke thickness in pixels"),
 			},
-			async ({ nodeId, strokes, strokeWeight }) => {
+			async ({ nodeId, strokes, strokeWeight }) => this.withLogging(
+				"figma_set_strokes",
+				{nodeId, strokes, strokeWeight},
+				async () => {
 				try {
 					const connector = await this.getDesktopConnector();
 					const result = await connector.setNodeStrokes(
@@ -4212,7 +4399,9 @@ After instantiating components, use figma_take_screenshot to verify the result l
 						isError: true,
 					};
 				}
-			},
+				},
+				(p) => `Updated strokes on node ${p.nodeId}`,
+			),
 		);
 
 		// Tool: Clone Node
@@ -4222,7 +4411,10 @@ After instantiating components, use figma_take_screenshot to verify the result l
 			{
 				nodeId: z.string().describe("The node ID to clone"),
 			},
-			async ({ nodeId }) => {
+			async ({ nodeId }) => this.withLogging(
+				"figma_clone_node",
+				{ nodeId },
+				async () => {
 				try {
 					const connector = await this.getDesktopConnector();
 					const result = await connector.cloneNode(nodeId);
@@ -4262,7 +4454,9 @@ After instantiating components, use figma_take_screenshot to verify the result l
 						isError: true,
 					};
 				}
-			},
+				},
+				(p) => `Cloned node ${p.nodeId}`,
+			),
 		);
 
 		// Tool: Delete Node
@@ -4272,7 +4466,10 @@ After instantiating components, use figma_take_screenshot to verify the result l
 			{
 				nodeId: z.string().describe("The node ID to delete"),
 			},
-			async ({ nodeId }) => {
+			async ({ nodeId }) => this.withLogging(
+				"figma_delete_node",
+				{ nodeId },
+				async () => {
 				try {
 					const connector = await this.getDesktopConnector();
 					const result = await connector.deleteNode(nodeId);
@@ -4312,7 +4509,9 @@ After instantiating components, use figma_take_screenshot to verify the result l
 						isError: true,
 					};
 				}
-			},
+				},
+				(p) => `Deleted node ${p.nodeId}`,
+			),
 		);
 
 		// Tool: Rename Node
@@ -4323,7 +4522,10 @@ After instantiating components, use figma_take_screenshot to verify the result l
 				nodeId: z.string().describe("The node ID to rename"),
 				newName: z.string().describe("The new name for the node"),
 			},
-			async ({ nodeId, newName }) => {
+			async ({ nodeId, newName }) => this.withLogging(
+				"figma_rename_node",
+				{nodeId, newName},
+				async () => {
 				try {
 					const connector = await this.getDesktopConnector();
 					const result = await connector.renameNode(nodeId, newName);
@@ -4363,7 +4565,9 @@ After instantiating components, use figma_take_screenshot to verify the result l
 						isError: true,
 					};
 				}
-			},
+				},
+				(p) => `Renamed node to "${p.newName}"`,
+			),
 		);
 
 		// Tool: Set Text Content
@@ -4375,7 +4579,10 @@ After instantiating components, use figma_take_screenshot to verify the result l
 				text: z.string().describe("The new text content"),
 				fontSize: z.number().optional().describe("Optional font size to set"),
 			},
-			async ({ nodeId, text, fontSize }) => {
+			async ({ nodeId, text, fontSize }) => this.withLogging(
+				"figma_set_text",
+				{nodeId, text, fontSize},
+				async () => {
 				try {
 					const connector = await this.getDesktopConnector();
 					const result = await connector.setTextContent(
@@ -4420,7 +4627,9 @@ After instantiating components, use figma_take_screenshot to verify the result l
 						isError: true,
 					};
 				}
-			},
+				},
+				(p) => `Updated text content on node ${p.nodeId}`,
+			),
 		);
 
 		// Tool: Create Child Node
@@ -4456,7 +4665,10 @@ After instantiating components, use figma_take_screenshot to verify the result l
 					.optional()
 					.describe("Properties for the new node"),
 			},
-			async ({ parentId, nodeType, properties }) => {
+			async ({ parentId, nodeType, properties }) => this.withLogging(
+				"figma_create_child",
+				{parentId, nodeType, properties},
+				async () => {
 				try {
 					const connector = await this.getDesktopConnector();
 					const result = await connector.createChildNode(
@@ -4501,7 +4713,9 @@ After instantiating components, use figma_take_screenshot to verify the result l
 						isError: true,
 					};
 				}
-			},
+				},
+				(p) => `Created ${p.nodeType} node in parent ${p.parentId}`,
+			),
 		);
 
 		// Tool: Arrange Component Set (Professional Layout with Native Visualization)
@@ -4548,7 +4762,10 @@ Recreates the set using figma.combineAsVariants() for proper Figma integration, 
 					.optional()
 					.describe("Layout options"),
 			},
-			async ({ componentSetId, componentSetName, options }) => {
+			async ({ componentSetId, componentSetName, options }) => this.withLogging(
+				"figma_arrange_component_set",
+				{componentSetId, componentSetName, options},
+				async () => {
 				try {
 					const connector = await this.getDesktopConnector();
 
@@ -5028,7 +5245,9 @@ return {
 						isError: true,
 					};
 				}
-			},
+				},
+				(p) => `Arranged component set${p.componentSetName ? ': ' + p.componentSetName : ''}`,
+			),
 		);
 
 		// Register Figma API tools (Tools 8-11)
@@ -5503,6 +5722,10 @@ return {
 			}
 
 			if (this.wsServer) {
+				// Initialise session tracker and wire it into the WebSocket server
+				this.sessionTracker = new SessionTracker();
+				this.wsServer.setSessionTracker(this.sessionTracker);
+
 				// Log when plugin files connect/disconnect (with file identity)
 				this.wsServer.on("fileConnected", (data: { fileKey: string; fileName: string }) => {
 					logger.info({ fileKey: data.fileKey, fileName: data.fileName }, "Desktop Bridge plugin connected via WebSocket");

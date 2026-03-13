@@ -17,6 +17,7 @@ import { WebSocketServer as WSServer, WebSocket } from 'ws';
 import { EventEmitter } from 'events';
 import { createChildLogger } from './logger.js';
 import type { ConsoleLogEntry } from './types/index.js';
+import type { SessionTracker } from './session-tracker.js';
 
 const logger = createChildLogger({ component: 'websocket-server' });
 
@@ -91,6 +92,13 @@ export class FigmaWebSocketServer extends EventEmitter {
   private _isStarted = false;
   private consoleBufferSize = 1000;
   private documentChangeBufferSize = 200;
+  /** Optional session tracker — set after construction via setSessionTracker() */
+  private sessionTracker: SessionTracker | null = null;
+
+  /** Wire in a SessionTracker after server creation. All event calls are null-safe. */
+  setSessionTracker(tracker: SessionTracker): void {
+    this.sessionTracker = tracker;
+  }
 
   constructor(options: WebSocketServerOptions) {
     super();
@@ -244,6 +252,25 @@ export class FigmaWebSocketServer extends EventEmitter {
             found.client.documentChanges.shift();
           }
           found.client.lastActivity = Date.now();
+
+          // Session logger — enrich with per-type counts from plugin (additive fields)
+          this.sessionTracker?.logEvent({
+            kind: 'document_changed',
+            timestamp: message.data.timestamp || Date.now(),
+            fileKey: found.fileKey,
+            fileName: found.client.fileInfo.fileName,
+            summary: {
+              creates: message.data.creates ?? 0,
+              deletes: message.data.deletes ?? 0,
+              propertyChanges: message.data.propertyChanges ?? 0,
+              styleChanges: message.data.styleChanges ?? 0,
+              changedNodeIds: message.data.changedNodeIds || [],
+              hasStyleChanges: message.data.hasStyleChanges,
+              hasNodeChanges: message.data.hasNodeChanges,
+              changeCount: message.data.changeCount || 0,
+              timestamp: message.data.timestamp || Date.now(),
+            },
+          });
         }
         this.emit('documentChange', { fileKey: found?.fileKey ?? null, ...message.data });
       }
@@ -255,6 +282,20 @@ export class FigmaWebSocketServer extends EventEmitter {
           found.client.selection = message.data as SelectionInfo;
           found.client.lastActivity = Date.now();
           this._activeFileKey = found.fileKey;
+
+          this.sessionTracker?.logEvent({
+            kind: 'selection_changed',
+            timestamp: message.data.timestamp || Date.now(),
+            fileKey: found.fileKey,
+            fileName: found.client.fileInfo.fileName,
+            nodes: (message.data.nodes || []).map((n: any) => ({
+              id: n.id,
+              name: n.name,
+              type: n.type,
+            })),
+            count: message.data.count ?? 0,
+            page: message.data.page ?? '',
+          });
         }
         this.emit('selectionChange', { fileKey: found?.fileKey ?? null, ...message.data });
       }
@@ -267,6 +308,15 @@ export class FigmaWebSocketServer extends EventEmitter {
           found.client.fileInfo.currentPageId = message.data.pageId || null;
           found.client.lastActivity = Date.now();
           this._activeFileKey = found.fileKey;
+
+          this.sessionTracker?.logEvent({
+            kind: 'page_changed',
+            timestamp: message.data.timestamp || Date.now(),
+            fileKey: found.fileKey,
+            fileName: found.client.fileInfo.fileName,
+            pageId: message.data.pageId || '',
+            pageName: message.data.pageName || '',
+          });
         }
         this.emit('pageChange', { fileKey: found?.fileKey ?? null, ...message.data });
       }
@@ -370,6 +420,14 @@ export class FigmaWebSocketServer extends EventEmitter {
     // On bulk reconnect the order is non-deterministic, but the first user interaction
     // (SELECTION_CHANGE or PAGE_CHANGE) will correct the active file immediately.
     this._activeFileKey = fileKey;
+
+    this.sessionTracker?.logEvent({
+      kind: 'file_connected',
+      timestamp: Date.now(),
+      fileKey,
+      fileName: data.fileName ?? null,
+      pageName: data.currentPage ?? null,
+    });
 
     logger.info(
       {
