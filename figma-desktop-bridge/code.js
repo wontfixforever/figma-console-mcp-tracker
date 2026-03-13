@@ -2132,13 +2132,32 @@ figma.loadAllPagesAsync().then(function() {
     var hasStyleChanges = false;
     var hasNodeChanges = false;
     var changedNodeIds = [];
+    // Per-type counters for session logger (additive — existing consumers ignore these)
+    var createCount = 0;
+    var deleteCount = 0;
+    var propertyChangeCount = 0;
+    var styleChangeCount = 0;
 
     for (var i = 0; i < event.documentChanges.length; i++) {
       var change = event.documentChanges[i];
       if (change.type === 'STYLE_CREATE' || change.type === 'STYLE_DELETE' || change.type === 'STYLE_PROPERTY_CHANGE') {
         hasStyleChanges = true;
-      } else if (change.type === 'CREATE' || change.type === 'DELETE' || change.type === 'PROPERTY_CHANGE') {
+        styleChangeCount++;
+      } else if (change.type === 'CREATE') {
         hasNodeChanges = true;
+        createCount++;
+        if (change.id && changedNodeIds.length < 50) {
+          changedNodeIds.push(change.id);
+        }
+      } else if (change.type === 'DELETE') {
+        hasNodeChanges = true;
+        deleteCount++;
+        if (change.id && changedNodeIds.length < 50) {
+          changedNodeIds.push(change.id);
+        }
+      } else if (change.type === 'PROPERTY_CHANGE') {
+        hasNodeChanges = true;
+        propertyChangeCount++;
         if (change.id && changedNodeIds.length < 50) {
           changedNodeIds.push(change.id);
         }
@@ -2153,7 +2172,11 @@ figma.loadAllPagesAsync().then(function() {
           hasNodeChanges: hasNodeChanges,
           changedNodeIds: changedNodeIds,
           changeCount: event.documentChanges.length,
-          timestamp: Date.now()
+          timestamp: Date.now(),
+          creates: createCount,
+          deletes: deleteCount,
+          propertyChanges: propertyChangeCount,
+          styleChanges: styleChangeCount
         }
       });
     }
