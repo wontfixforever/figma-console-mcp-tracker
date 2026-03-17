@@ -79,6 +79,83 @@
       margin-left: 4px;
     }
 
+    /* Session list */
+    .session-list {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      width: 100%;
+      margin-top: 4px;
+    }
+
+    .session-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 6px;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 10px;
+      color: var(--figma-color-text-secondary, rgba(255, 255, 255, 0.6));
+      transition: background 0.1s;
+    }
+
+    .session-item:hover {
+      background: var(--figma-color-bg-hover, rgba(255, 255, 255, 0.08));
+      color: var(--figma-color-text, rgba(255, 255, 255, 0.9));
+    }
+
+    .session-item.selected {
+      color: var(--figma-color-text, rgba(255, 255, 255, 0.9));
+    }
+
+    .session-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .session-dot.active {
+      background: #18a957;
+      box-shadow: 0 0 4px rgba(24, 169, 87, 0.6);
+    }
+
+    .session-dot.connected {
+      background: rgba(255, 255, 255, 0.25);
+    }
+
+    .session-dot.error {
+      background: #f24822;
+    }
+
+    .session-label {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 140px;
+    }
+
+    /* When session list is visible, stack vertically */
+    body.multi-session {
+      align-items: flex-start;
+      padding: 6px 6px;
+    }
+
+    body.multi-session .bridge-status {
+      width: 100%;
+      flex-direction: column;
+      align-items: flex-start;
+      padding: 4px 6px;
+    }
+
+    body.multi-session .status-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      width: 100%;
+    }
+
     /* Light theme support */
     @media (prefers-color-scheme: light) {
       body {
@@ -95,16 +172,32 @@
       .status-text .state {
         color: #333;
       }
+      .session-item {
+        color: #888;
+      }
+      .session-item:hover {
+        background: rgba(0, 0, 0, 0.05);
+        color: #333;
+      }
+      .session-item.selected {
+        color: #333;
+      }
+      .session-dot.connected {
+        background: rgba(0, 0, 0, 0.2);
+      }
     }
   </style>
 </head>
 <body>
   <div class="bridge-status" id="status-container">
-    <div class="status-indicator loading" id="status-dot"></div>
-    <div class="status-text">
-      <span class="label">MCP</span>
-      <span class="state" id="status-state">connecting</span>
+    <div class="status-row">
+      <div class="status-indicator loading" id="status-dot"></div>
+      <div class="status-text">
+        <span class="label">MCP</span>
+        <span class="state" id="status-state">connecting</span>
+      </div>
     </div>
+    <div class="session-list" id="session-list"></div>
   </div>
 
   <script>
@@ -432,6 +525,10 @@
       var wsMaxReconnectAttempts = 50;
       var isScanning = false;
 
+      // Session switcher state
+      var selectedPort = null;     // port of the session receiving events; null until first connect
+      var sessionLabels = {};      // { port: "Session Name" }
+
       // Backward-compat: ws and wsConnected reflect "at least one connection"
       var ws = null;
       var wsPort = null;
@@ -506,7 +603,14 @@
        */
       function removeConnection(port) {
         activeConnections = activeConnections.filter(function(c) { return c.port !== port; });
+        delete sessionLabels[port];
+        // If the active session disconnected, auto-select the next live one
+        if (selectedPort === port) {
+          var live = activeConnections.filter(function(c) { return c.ws.readyState === 1; });
+          selectedPort = live.length > 0 ? live[0].port : null;
+        }
         updateCompatState();
+        renderSessionList();
       }
 
       /**
@@ -590,6 +694,7 @@
 
               // Add to active connections
               activeConnections.push({ port: port, ws: testWs });
+              if (selectedPort === null) selectedPort = port;
               updateCompatState();
 
               console.log('[MCP Bridge] WebSocket connected to port ' + port + ' (' + activeConnections.length + ' server(s) total)');
@@ -667,6 +772,7 @@
           testWs.onopen = function() {
             clearTimeout(timeout);
             activeConnections.push({ port: port, ws: testWs });
+            if (selectedPort === null) selectedPort = port;
             updateCompatState();
             console.log('[MCP Bridge] Reconnected to port ' + port + ' (' + activeConnections.length + ' server(s) total)');
             attachWsHandlers(testWs, port);
@@ -690,6 +796,14 @@
         activeWs.onmessage = function(event) {
           try {
             var message = JSON.parse(event.data);
+
+            // Handle server-push messages (no id/method)
+            if (message.type === 'SERVER_HELLO') {
+              sessionLabels[port] = message.sessionName || ('Port ' + port);
+              renderSessionList();
+              return;
+            }
+
             if (!message.id || !message.method) {
               console.log('[MCP Bridge] WS:' + port + ': Ignoring malformed message');
               return;
@@ -749,8 +863,7 @@
 
       /**
        * Broadcast a message to ALL active WebSocket connections.
-       * Events like variable changes, selections, document changes need to
-       * reach every MCP server instance so they all have current state.
+       * Used for VARIABLES_DATA which every server needs for its cache.
        */
       function broadcastToAll(message) {
         var json = JSON.stringify(message);
@@ -761,6 +874,77 @@
         });
       }
 
+      /**
+       * Send an event message to the selected session only.
+       * Falls back to broadcastToAll if no session is selected yet.
+       */
+      function sendToActive(message) {
+        if (selectedPort === null) {
+          broadcastToAll(message);
+          return;
+        }
+        var json = JSON.stringify(message);
+        for (var i = 0; i < activeConnections.length; i++) {
+          var conn = activeConnections[i];
+          if (conn.port === selectedPort && conn.ws.readyState === 1) {
+            try { conn.ws.send(json); } catch(e) { /* ignore */ }
+            return;
+          }
+        }
+      }
+
+      /**
+       * Render the session switcher list and resize the plugin UI if needed.
+       * Shows nothing when there is only one connection.
+       */
+      function renderSessionList() {
+        var list = document.getElementById('session-list');
+        var body = document.body;
+        if (!list) return;
+
+        var count = activeConnections.length;
+
+        if (count <= 1) {
+          list.innerHTML = '';
+          body.classList.remove('multi-session');
+          parent.postMessage({ pluginMessage: { type: 'RESIZE_UI', width: 120, height: 36 } }, '*');
+          return;
+        }
+
+        body.classList.add('multi-session');
+
+        var html = '';
+        for (var i = 0; i < activeConnections.length; i++) {
+          var conn = activeConnections[i];
+          var label = sessionLabels[conn.port] || ('Port ' + conn.port);
+          var isSelected = conn.port === selectedPort;
+          var isLive = conn.ws.readyState === 1;
+          var dotClass = isLive ? (isSelected ? 'active' : 'connected') : 'error';
+          var itemClass = 'session-item' + (isSelected ? ' selected' : '');
+          html += '<div class="' + itemClass + '" data-port="' + conn.port + '">';
+          html += '<div class="session-dot ' + dotClass + '"></div>';
+          html += '<span class="session-label">' + label + '</span>';
+          html += '</div>';
+        }
+        list.innerHTML = html;
+
+        // Attach click handlers for switching the active session
+        var items = list.querySelectorAll('.session-item');
+        for (var j = 0; j < items.length; j++) {
+          (function(item) {
+            item.addEventListener('click', function() {
+              var port = parseInt(item.getAttribute('data-port'), 10);
+              selectedPort = port;
+              renderSessionList();
+            });
+          })(items[j]);
+        }
+
+        // Resize: header row (36) + each session row (26) + gap padding (8)
+        var newHeight = 36 + (count * 26) + 8;
+        parent.postMessage({ pluginMessage: { type: 'RESIZE_UI', width: 160, height: newHeight } }, '*');
+      }
+
       // Forward VARIABLES_DATA to all connected MCP servers
       window.__wsForwardVariables = function(data) {
         if (wsConnected) {
@@ -768,31 +952,31 @@
         }
       };
 
-      // Forward DOCUMENT_CHANGE events to all servers for cache invalidation
+      // Forward DOCUMENT_CHANGE events to the active session only
       window.__wsForwardDocumentChange = function(data) {
         if (wsConnected) {
-          broadcastToAll({ type: 'DOCUMENT_CHANGE', data: data });
+          sendToActive({ type: 'DOCUMENT_CHANGE', data: data });
         }
       };
 
-      // Forward CONSOLE_CAPTURE events to all servers for console monitoring
+      // Forward CONSOLE_CAPTURE events to the active session only
       window.__wsForwardConsoleCapture = function(data) {
         if (wsConnected) {
-          broadcastToAll({ type: 'CONSOLE_CAPTURE', data: data });
+          sendToActive({ type: 'CONSOLE_CAPTURE', data: data });
         }
       };
 
-      // Forward SELECTION_CHANGE events to all servers for selection tracking
+      // Forward SELECTION_CHANGE events to the active session only
       window.__wsForwardSelectionChange = function(data) {
         if (wsConnected) {
-          broadcastToAll({ type: 'SELECTION_CHANGE', data: data });
+          sendToActive({ type: 'SELECTION_CHANGE', data: data });
         }
       };
 
-      // Forward PAGE_CHANGE events to all servers for page tracking
+      // Forward PAGE_CHANGE events to the active session only
       window.__wsForwardPageChange = function(data) {
         if (wsConnected) {
-          broadcastToAll({ type: 'PAGE_CHANGE', data: data });
+          sendToActive({ type: 'PAGE_CHANGE', data: data });
         }
       };
 

@@ -18,7 +18,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { fileURLToPath } from "url";
-import { dirname, resolve } from "path";
+import { dirname, resolve, basename } from "path";
 import { realpathSync, existsSync } from "fs";
 import { LocalBrowserManager } from "./browser/local.js";
 import { ConsoleMonitor } from "./core/console-monitor.js";
@@ -5655,6 +5655,7 @@ return {
 			// try subsequent ports in the range (9223-9232) so multiple instances can coexist.
 			const wsHost = process.env.FIGMA_WS_HOST || 'localhost';
 			this.wsPreferredPort = parseInt(process.env.FIGMA_WS_PORT || String(DEFAULT_WS_PORT), 10);
+			const wsSessionName = process.env.FIGMA_SESSION_NAME || basename(process.cwd());
 
 			// Clean up any stale port files from crashed instances before trying to bind
 			cleanupStalePortFiles();
@@ -5664,7 +5665,7 @@ return {
 
 			for (const port of portsToTry) {
 				try {
-					this.wsServer = new FigmaWebSocketServer({ port, host: wsHost });
+					this.wsServer = new FigmaWebSocketServer({ port, host: wsHost, sessionName: wsSessionName });
 					await this.wsServer.start();
 
 					// Get the actual bound port (should match, but verify)
@@ -5682,7 +5683,7 @@ return {
 					}
 
 					// Advertise the port so the Figma plugin and other tools can discover us
-					advertisePort(boundPort, wsHost);
+					advertisePort(boundPort, wsHost, wsSessionName);
 					registerPortCleanup(boundPort);
 
 					break;

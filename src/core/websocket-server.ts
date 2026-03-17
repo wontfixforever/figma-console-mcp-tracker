@@ -24,6 +24,8 @@ const logger = createChildLogger({ component: 'websocket-server' });
 export interface WebSocketServerOptions {
   port: number;
   host?: string;
+  /** Human-readable label for this server instance, shown in the plugin's session switcher UI. */
+  sessionName?: string;
 }
 
 interface PendingRequest {
@@ -167,6 +169,19 @@ export class FigmaWebSocketServer extends EventEmitter {
             { totalClients: this.clients.size, pendingClients: this._pendingClients.size },
             'New WebSocket connection (pending file identification)'
           );
+
+          // Greet the plugin with session identity so it can label this connection
+          // in the session switcher UI. Sent before FILE_INFO so the label is available
+          // as soon as the connection opens.
+          if (ws.readyState === ws.OPEN) {
+            try {
+              ws.send(JSON.stringify({
+                type: 'SERVER_HELLO',
+                sessionName: this.options.sessionName ?? null,
+                port: this.options.port,
+              }));
+            } catch { /* best-effort — plugin will fall back to port number as label */ }
+          }
 
           ws.on('message', (data: import('ws').RawData) => {
             try {

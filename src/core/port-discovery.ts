@@ -40,6 +40,7 @@ export interface PortFileData {
   pid: number;
   host: string;
   startedAt: string;
+  sessionName?: string;
 }
 
 /**
@@ -68,14 +69,15 @@ export function getPortFilePath(port: number): string {
 
 /**
  * Write a port advertisement file so clients can discover this server instance.
- * Includes PID for stale-file detection.
+ * Includes PID for stale-file detection and optional session name for identification.
  */
-export function advertisePort(port: number, host: string = 'localhost'): void {
+export function advertisePort(port: number, host: string = 'localhost', sessionName?: string): void {
   const data: PortFileData = {
     port,
     pid: process.pid,
     host,
     startedAt: new Date().toISOString(),
+    ...(sessionName ? { sessionName } : {}),
   };
 
   const filePath = getPortFilePath(port);
