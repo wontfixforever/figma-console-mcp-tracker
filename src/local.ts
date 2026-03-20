@@ -1542,6 +1542,95 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 		);
 
 		// ============================================================================
+		// Tool: Connect to a specific WebSocket port
+		// ============================================================================
+		this.server.tool(
+			"figma_connect_port",
+			"Switch the MCP server to listen on a specific port, allowing the Figma Desktop Bridge plugin pinned to that port to connect. Use this to target a specific Figma window when multiple plugin instances are open on different ports.",
+			{
+				port: z
+					.number()
+					.int()
+					.min(9223)
+					.max(9232)
+					.describe("The port number to connect to (9223-9232)"),
+			},
+			async ({ port }) => {
+				try {
+					// Already on the requested port
+					if (this.wsActualPort === port && this.wsServer?.isClientConnected()) {
+						return {
+							content: [{
+								type: "text",
+								text: JSON.stringify({
+									status: "already_connected",
+									port,
+									message: `Already connected on port ${port}`,
+								}),
+							}],
+						};
+					}
+
+					// Tear down current WS server
+					if (this.wsActualPort) {
+						unadvertisePort(this.wsActualPort);
+					}
+					if (this.wsServer) {
+						await this.wsServer.stop();
+						this.wsServer = null;
+					}
+					this.wsActualPort = null;
+					this.desktopConnector = null;
+
+					// Start a new WS server on the exact requested port (no fallback)
+					const wsHost = process.env.FIGMA_WS_HOST || 'localhost';
+					const wsSessionName = process.env.FIGMA_SESSION_NAME || basename(process.cwd());
+
+					const newServer = new FigmaWebSocketServer({ port, host: wsHost, sessionName: wsSessionName });
+					await newServer.start();
+
+					this.wsServer = newServer;
+					this.wsActualPort = port;
+					this.wsPreferredPort = port;
+
+					advertisePort(port, wsHost, wsSessionName);
+					registerPortCleanup(port);
+
+					// Re-wire session tracker
+					if (this.sessionTracker) {
+						this.wsServer.setSessionTracker(this.sessionTracker);
+					}
+
+					return {
+						content: [{
+							type: "text",
+							text: JSON.stringify({
+								status: "listening",
+								port,
+								message: `Now listening on port ${port}. Open or reload the Desktop Bridge plugin in the target Figma window to connect.`,
+							}),
+						}],
+					};
+				} catch (error) {
+					const msg = error instanceof Error ? error.message : String(error);
+					const isInUse = msg.includes("EADDRINUSE");
+					return {
+						content: [{
+							type: "text",
+							text: JSON.stringify({
+								error: msg,
+								message: isInUse
+									? `Port ${port} is already in use by another MCP server instance. Choose a different port.`
+									: `Failed to switch to port ${port}: ${msg}`,
+							}),
+						}],
+						isError: true,
+					};
+				}
+			},
+		);
+
+		// ============================================================================
 		// REAL-TIME AWARENESS TOOLS (WebSocket-only)
 		// ============================================================================
 

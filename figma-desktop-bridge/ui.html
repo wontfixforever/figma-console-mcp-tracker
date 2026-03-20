@@ -9,28 +9,33 @@
       padding: 0;
     }
 
+    html {
+      overflow: hidden;
+    }
+
     body {
       font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
       font-size: 11px;
       background: var(--figma-color-bg, #2c2c2c);
       color: var(--figma-color-text, rgba(255, 255, 255, 0.9));
-      height: 100%;
+      height: auto;
       display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 6px 8px;
+      align-items: flex-start;
+      justify-content: flex-start;
+      padding: 8px 8px 4px;
       user-select: none;
     }
 
     .bridge-status {
       display: flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 8px;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 0;
+      padding: 8px;
       background: var(--figma-color-bg-secondary, #383838);
       border: 1px solid var(--figma-color-border, #4a4a4a);
-      border-radius: 4px;
-      white-space: nowrap;
+      border-radius: 6px;
+      width: 100%;
     }
 
     .status-indicator {
@@ -136,20 +141,50 @@
       max-width: 140px;
     }
 
-    /* When session list is visible, stack vertically */
-    body.multi-session {
-      align-items: flex-start;
-      padding: 6px 6px;
+    /* Port selector row */
+    .port-row {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      width: 100%;
+      margin-top: 6px;
+      padding-top: 8px;
+      border-top: 1px solid var(--figma-color-border, #4a4a4a);
     }
 
-    body.multi-session .bridge-status {
+    .port-row .label {
+      font-size: 10px;
+      color: var(--figma-color-text-secondary, rgba(255, 255, 255, 0.5));
+      flex-shrink: 0;
+    }
+
+    .port-row select {
+      flex: 1;
+      -webkit-appearance: none;
+      appearance: none;
+      background-color: var(--figma-color-bg, #1e1e1e);
+      background-image: url("data:image/svg+xml,%3Csvg width='8' height='5' viewBox='0 0 8 5' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L4 4L7 1' stroke='rgba(255,255,255,0.4)' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 5px center;
+      color: var(--figma-color-text, rgba(255, 255, 255, 0.9));
+      border: none;
+      border-radius: 3px;
+      font-size: 10px;
+      font-family: inherit;
+      height: 20px;
+      padding: 0 18px 0 6px;
+      cursor: pointer;
+      outline: none;
+      min-width: 0;
+    }
+
+    .bridge-status {
       width: 100%;
       flex-direction: column;
       align-items: flex-start;
-      padding: 4px 6px;
     }
 
-    body.multi-session .status-row {
+    .status-row {
       display: flex;
       align-items: center;
       gap: 6px;
@@ -185,6 +220,17 @@
       .session-dot.connected {
         background: rgba(0, 0, 0, 0.2);
       }
+      .port-row select {
+        background-color: #f0f0f0;
+        background-image: url("data:image/svg+xml,%3Csvg width='8' height='5' viewBox='0 0 8 5' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L4 4L7 1' stroke='rgba(0,0,0,0.4)' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+        color: #333;
+      }
+      .port-row .label {
+        color: #888;
+      }
+      .port-row {
+        border-top-color: #e5e5e5;
+      }
     }
   </style>
 </head>
@@ -198,6 +244,22 @@
       </div>
     </div>
     <div class="session-list" id="session-list"></div>
+    <div class="port-row">
+      <span class="label">Port</span>
+      <select id="port-select">
+        <option value="auto">Auto</option>
+        <option value="9223">9223</option>
+        <option value="9224">9224</option>
+        <option value="9225">9225</option>
+        <option value="9226">9226</option>
+        <option value="9227">9227</option>
+        <option value="9228">9228</option>
+        <option value="9229">9229</option>
+        <option value="9230">9230</option>
+        <option value="9231">9231</option>
+        <option value="9232">9232</option>
+      </select>
+    </div>
   </div>
 
   <script>
@@ -527,6 +589,7 @@
 
       // Session switcher state
       var selectedPort = null;     // port of the session receiving events; null until first connect
+      var pinnedPort = null;       // null = auto (connect to all), number = locked to one port
       var sessionLabels = {};      // { port: "Session Name" }
 
       // Backward-compat: ws and wsConnected reflect "at least one connection"
@@ -661,10 +724,17 @@
         isScanning = true;
 
         var portsToTry = [];
-        for (var p = WS_PORT_RANGE_START; p <= WS_PORT_RANGE_END; p++) {
-          // Skip ports we're already connected to
-          if (!isPortConnected(p)) {
-            portsToTry.push(p);
+        if (pinnedPort !== null) {
+          // Pinned mode: only connect to the selected port
+          if (!isPortConnected(pinnedPort)) {
+            portsToTry.push(pinnedPort);
+          }
+        } else {
+          // Auto mode: scan full range
+          for (var p = WS_PORT_RANGE_START; p <= WS_PORT_RANGE_END; p++) {
+            if (!isPortConnected(p)) {
+              portsToTry.push(p);
+            }
           }
         }
 
@@ -673,7 +743,8 @@
           return;
         }
 
-        console.log('[MCP Bridge] Scanning ports ' + WS_PORT_RANGE_START + '-' + WS_PORT_RANGE_END + ' for MCP servers...');
+        var scanDesc = pinnedPort !== null ? ('port ' + pinnedPort) : ('ports ' + WS_PORT_RANGE_START + '-' + WS_PORT_RANGE_END);
+        console.log('[MCP Bridge] Scanning ' + scanDesc + ' for MCP servers...');
 
         var foundAny = false;
         var pending = portsToTry.length;
@@ -758,6 +829,8 @@
        * then does a full rescan to pick up any new servers.
        */
       function wsReconnectPort(port) {
+        // In pinned mode, only reconnect to the pinned port
+        if (pinnedPort !== null && port !== pinnedPort) return;
         try {
           var testWs = new WebSocket('ws://localhost:' + port);
           var timeout = setTimeout(function() {
@@ -899,19 +972,18 @@
        */
       function renderSessionList() {
         var list = document.getElementById('session-list');
-        var body = document.body;
         if (!list) return;
 
         var count = activeConnections.length;
 
+        // Base height: status row (28) + port row (32) + bridge-status padding (16) + body padding (12) + spacing delta (5) = 93
+        var BASE_HEIGHT = 93;
+
         if (count <= 1) {
           list.innerHTML = '';
-          body.classList.remove('multi-session');
-          parent.postMessage({ pluginMessage: { type: 'RESIZE_UI', width: 120, height: 36 } }, '*');
+          parent.postMessage({ pluginMessage: { type: 'RESIZE_UI', width: 160, height: BASE_HEIGHT } }, '*');
           return;
         }
-
-        body.classList.add('multi-session');
 
         var html = '';
         for (var i = 0; i < activeConnections.length; i++) {
@@ -940,9 +1012,61 @@
           })(items[j]);
         }
 
-        // Resize: header row (36) + each session row (26) + gap padding (8)
-        var newHeight = 36 + (count * 26) + 8;
+        // Resize: base (64) + each session row (24)
+        var newHeight = BASE_HEIGHT + (count * 24);
         parent.postMessage({ pluginMessage: { type: 'RESIZE_UI', width: 160, height: newHeight } }, '*');
+      }
+
+      /**
+       * Update the dropdown to reflect current pinnedPort state.
+       */
+      function updateDropdown() {
+        var sel = document.getElementById('port-select');
+        if (!sel) return;
+        sel.value = pinnedPort === null ? 'auto' : String(pinnedPort);
+      }
+
+      /**
+       * Pin the plugin to a specific port (or null for auto).
+       * Closes connections to all other ports when pinning.
+       */
+      function selectPort(port) {
+        pinnedPort = port;
+
+        if (port !== null) {
+          // Close all connections that aren't the pinned port
+          activeConnections.slice().forEach(function(conn) {
+            if (conn.port !== port) {
+              console.log('[MCP Bridge] Pinned to ' + port + ', closing port ' + conn.port);
+              conn.ws.close(1000, 'Replaced by pin selection');
+            }
+          });
+          // Route events to the pinned port immediately
+          selectedPort = port;
+          // Connect to the pinned port if not already connected
+          if (!isPortConnected(port)) {
+            wsReconnectAttempts = 0;
+            wsReconnectDelay = 500;
+            wsScanAndConnect();
+          }
+        } else {
+          // Auto mode: rescan all ports
+          wsReconnectAttempts = 0;
+          wsReconnectDelay = 500;
+          wsScanAndConnect();
+        }
+
+        updateDropdown();
+        renderSessionList();
+      }
+
+      // Wire up the dropdown
+      var portSelect = document.getElementById('port-select');
+      if (portSelect) {
+        portSelect.addEventListener('change', function() {
+          var val = portSelect.value;
+          selectPort(val === 'auto' ? null : parseInt(val, 10));
+        });
       }
 
       // Forward VARIABLES_DATA to all connected MCP servers
@@ -979,6 +1103,9 @@
           sendToActive({ type: 'PAGE_CHANGE', data: data });
         }
       };
+
+      // Initial resize to show port row on load
+      parent.postMessage({ pluginMessage: { type: 'RESIZE_UI', width: 160, height: 93 } }, '*');
 
       // Start WebSocket connection via port scanning
       wsScanAndConnect();
